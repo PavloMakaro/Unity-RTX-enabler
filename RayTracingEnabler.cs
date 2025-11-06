@@ -1,215 +1,244 @@
-// ─────────────────────────────────────────────────────────────────────────────
-//  RayTracingEnabler.cs   (Unity 2023.2+ / Unity 6 HDRP)
-//  One-click + UI окно для включения Ray Tracing
-//  Всё в одном файле: настройки, окно, логика применения
-// ─────────────────────────────────────────────────────────────────────────────
-using System;
-using UnityEditor;
-using UnityEditor.SceneManagement;
 using UnityEngine;
+using UnityEditor;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.HighDefinition;
+using System.Linq;
+using UnityEditor.SceneManagement;
 
-#region ── Перечисления ────────────────────────────────────────────────────────
-public enum RayTracingQuality { Low, Medium, High }
-public enum RayTracingDenoiser { SpatialTemporal, Temporal }
-#endregion
-
-#region ── ScriptableObject – настройки ───────────────────────────────────────
-[CreateAssetMenu(menuName = "RayTracing/Settings", fileName = "RayTracingSettings")]
-public class RayTracingSettings : ScriptableObject
-{
-    [Header("Quality")]
-    public RayTracingQuality quality = RayTracingQuality.Medium;
-
-    [Header("Effects")]
-    public bool reflections   = true;
-    public bool globalIllum   = true;
-    public bool shadows       = true;
-    public bool ambientOccl   = true;
-
-    [Header("Intensity")]
-    [Range(0f, 2f)] public float reflIntensity = 1f;
-    [Range(0f, 2f)] public float giIntensity   = 1f;
-    [Range(0f, 2f)] public float shadIntensity = 1f;
-    [Range(0f, 2f)] public float aoIntensity   = 1f;
-
-    // ── Вычисляемые параметры ───────────────────────────────────────────────
-    public int Samples => quality switch { RayTracingQuality.Low => 16, RayTracingQuality.Medium => 32, _ => 64 };
-    public RayTracingDenoiser Denoiser => quality == RayTracingQuality.Low ? RayTracingDenoiser.SpatialTemporal : RayTracingDenoiser.Temporal;
-}
-#endregion
-
-#region ── EditorWindow – UI ───────────────────────────────────────────────────
-public class RayTracingEnablerWindow : EditorWindow
-{
-    private RayTracingSettings settings;
-    private Vector2 scroll;
-
-    [MenuItem("Tools/Ray Tracing/Open Settings")]
-    static void Open() => GetWindow<RayTracingEnablerWindow>("Ray Tracing").Show();
-
-    void OnEnable()
-    {
-        const string path = "Assets/Editor/RayTracingEnabler/RayTracingSettings.asset";
-        settings = AssetDatabase.LoadAssetAtPath<RayTracingSettings>(path);
-        if (!settings)
-        {
-            settings = CreateInstance<RayTracingSettings>();
-            AssetDatabase.CreateAsset(settings, path);
-            AssetDatabase.SaveAssets();
-        }
-    }
-
-    void OnGUI()
-    {
-        GUILayout.Label("Ray Tracing Enabler", EditorStyles.boldLabel);
-        scroll = EditorGUILayout.BeginScrollView(scroll);
-
-        settings.quality = (RayTracingQuality)EditorGUILayout.EnumPopup("Quality", settings.quality);
-        settings.reflections = EditorGUILayout.Toggle("Ray-Traced Reflections", settings.reflections);
-        settings.globalIllum = EditorGUILayout.Toggle("Ray-Traced GI", settings.globalIllum);
-        settings.shadows     = EditorGUILayout.Toggle("Ray-Traced Shadows", settings.shadows);
-        settings.ambientOccl = EditorGUILayout.Toggle("Ray-Traced AO", settings.ambientOccl);
-
-        settings.reflIntensity = EditorGUILayout.Slider("Reflection Intensity", settings.reflIntensity, 0f, 2f);
-        settings.giIntensity   = EditorGUILayout.Slider("GI Intensity",       settings.giIntensity,   0f, 2f);
-        settings.shadIntensity = EditorGUILayout.Slider("Shadow Intensity",  settings.shadIntensity, 0f, 2f);
-        settings.aoIntensity   = EditorGUILayout.Slider("AO Intensity",      settings.aoIntensity,   0f, 2f);
-
-        EditorGUILayout.EndScrollView();
-
-        if (GUILayout.Button("Apply & Enable Ray Tracing"))
-        {
-            RayTracingEnabler.Apply(settings);
-            Close();
-        }
-
-        if (GUILayout.Button("Quick Enable (Medium defaults)"))
-        {
-            RayTracingEnabler.Apply(null);
-            Close();
-        }
-    }
-}
-#endregion
-
-#region ── Основная логика ─────────────────────────────────────────────────────
 public static class RayTracingEnabler
 {
-    [MenuItem("Tools/Ray Tracing/Quick Enable", priority = 0)]
-    public static void QuickEnable() => Apply(null);
+    private const string MENU_PATH = "Tools/Ray Tracing/";
+    private const string VOLUME_NAME = "RTX Global Volume";
+    private const string PROFILE_NAME = "RTX Volume Profile";
 
-    // ── Публичный API ───────────────────────────────────────────────────────
-    public static void Apply(RayTracingSettings user = null)
+    [MenuItem(MENU_PATH + "Quick Enable (Medium)", priority = 100)]
+    public static void QuickEnable() => EnableRayTracing(RTXPreset.Medium);
+
+    [MenuItem(MENU_PATH + "Open RTX Wizard...", priority = 101)]
+    public static void OpenWizard() => RTXWizardWindow.Open();
+
+    [MenuItem(MENU_PATH + "Remove All RTX Settings", priority = 200)]
+    public static void RemoveAll()
     {
-        // 1. Проверки HDRP
-        var hdrp = GraphicsSettings.currentRenderPipeline as HDRenderPipelineAsset;
-        if (!hdrp)
-        {
-            EditorUtility.DisplayDialog("Error", "HDRP required (Window → Package Manager → HDRP).", "OK");
+        if (!EditorUtility.DisplayDialog("Remove RTX", "Удалить ВСЕ настройки Ray Tracing (Volume, Profile, DX12 и т.д.)?", "Да", "Отмена"))
             return;
-        }
 
-        var global = HDRenderPipelineGlobalSettings.instance;
-        if (!global)
-        {
-            EditorUtility.DisplayDialog("Error", "Create HDRP Global Settings: Edit → Render Pipeline → HDRP Settings.", "OK");
+        Undo.RegisterCompleteObjectUndo(new UnityEngine.Object[] { }, "Remove RTX");
+        DisableRayTracing();
+        RemoveRTXVolume();
+        EditorUtility.DisplayDialog("RTX Enabler", "Все RTX-настройки удалены!", "OK");
+    }
+
+    static void EnableRayTracing(RTXPreset preset)
+    {
+        if (!HDRPCheck())
             return;
-        }
 
-        // 2. DX12 + отключение static batching (рекомендации Unity 2025)
-        if (EditorUserBuildSettings.activeBuildTarget == BuildTargetGroup.Standalone)
-        {
-            PlayerSettings.SetGraphicsApis(BuildTargetGroup.Standalone, new[] { GraphicsDeviceType.Direct3D12 });
-            PlayerSettings.staticBatching = false;
-            Debug.Log("DX12 + static batching disabled");
-        }
+        Undo.RegisterCompleteObjectUndo(new UnityEngine.Object[] { }, "Enable RTX");
 
-        // 3. Включаем RT в HDRP
-        hdrp.supportRayTracing = true;
-        hdrp.rayTracing = true;
-        global.supportRayTracing = true;
+        SetGraphicsAPI();
+        DisableStaticBatching();
+        DisableSRPBatcherIfNeeded();
 
-        // 4. Настройки по умолчанию, если пользователь не передал
-        if (user == null)
-        {
-            user = ScriptableObject.CreateInstance<RayTracingSettings>();
-            user.quality = RayTracingQuality.Medium;
-            user.reflections = user.globalIllum = user.shadows = user.ambientOccl = true;
-        }
+        var volume = GetOrCreateGlobalVolume();
+        var profile = GetOrCreateVolumeProfile(volume);
 
-        // 5. Global Volume
-        var go = GameObject.Find("Global Volume") ?? new GameObject("Global Volume");
-        var vol = go.GetComponent<Volume>() ?? go.AddComponent<Volume>();
-        vol.isGlobal = true;
-        vol.priority = 0;
-        go.hideFlags = HideFlags.HideInHierarchy;
+        ApplyPreset(profile, preset);
 
-        var profile = vol.sharedProfile ?? CreateProfile();
-        vol.sharedProfile = profile;
-
-        // 6. Overrides
-        Configure<RayTracingReflections>(profile, user.reflections, ov =>
-        {
-            ov.rayMaxIterations.value = user.Samples;
-            ov.rayTracing.value = true;
-            ov.quality.value = (int)user.quality;
-            ov.denoiser.value = (int)user.Denoiser;
-            ov.intensity.value = user.reflIntensity;
-        });
-
-        Configure<RayTracedGlobalIllumination>(profile, user.globalIllum, ov =>
-        {
-            ov.rayMaxIterations.value = user.Samples;
-            ov.rayTracing.value = true;
-            ov.quality.value = (int)user.quality;
-            ov.denoiser.value = (int)user.Denoiser;
-            ov.intensity.value = user.giIntensity;
-        });
-
-        Configure<RayTracedShadows>(profile, user.shadows, ov =>
-        {
-            ov.rayMaxIterations.value = user.Samples / 2;
-            ov.rayTracing.value = true;
-            ov.intensity.value = user.shadIntensity;
-        });
-
-        Configure<RayTracedAmbientOcclusion>(profile, user.ambientOccl, ov =>
-        {
-            ov.rayMaxIterations.value = user.Samples;
-            ov.rayTracing.value = true;
-            ov.quality.value = (int)user.quality;
-            ov.intensity.value = user.aoIntensity;
-        });
-
-        // 7. Realtime GI
-        Lightmapping.realtimeGI = true;
-
-        // 8. Сохранить
-        EditorUtility.SetDirty(hdrp);
-        EditorUtility.SetDirty(global);
-        EditorUtility.SetDirty(profile);
-        AssetDatabase.SaveAssets();
+        SetHDRPAssetRayTracing(profile);
         EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
-
-        EditorUtility.DisplayDialog("Success", $"Ray Tracing enabled – Quality: {user.quality}", "OK");
-        Debug.Log("Ray Tracing полностью настроен");
+        EditorUtility.DisplayDialog("RTX Enabler", $"Ray Tracing включён на пресете «{preset}»!\nПерезапустите Unity для полной активации.", "OK");
     }
 
-    // ── Утилиты ───────────────────────────────────────────────────────────────
-    static VolumeProfile CreateProfile()
+    static bool HDRPCheck()
     {
-        var p = ScriptableObject.CreateInstance<VolumeProfile>();
-        AssetDatabase.CreateAsset(p, "Assets/Editor/RayTracingEnabler/RT_VolumeProfile.asset");
-        return p;
+        if (!RenderPipelineManager.currentPipeline is HDRenderPipeline)
+        {
+            EditorUtility.DisplayDialog("RTX Enabler", "Проект должен быть на HDRP!", "OK");
+            return false;
+        }
+        if (!SystemInfo.supportsRayTracing)
+        {
+            EditorUtility.DisplayDialog("RTX Enabler", "Твоя видеокарта не поддерживает Ray Tracing\nНужна NVIDIA RTX или AMD RX 6000+", "OK");
+            return false;
+        }
+        return true;
     }
 
-    static void Configure<T>(VolumeProfile p, bool enable, Action<T> cfg) where T : VolumeComponent
+    static void SetGraphicsAPI()
     {
-        if (!p.TryGet(out T comp)) comp = p.Add<T>();
-        comp.active = enable;
-        if (enable) cfg(comp);
+        PlayerSettings.SetScriptingBackend(BuildTargetGroup.Standalone, ScriptingImplementation.IL2CPP);
+        var apis = PlayerSettings.GetGraphicsAPIs(BuildTarget.StandaloneWindows64);
+        if (!apis.Contains(GraphicsDeviceType.Direct3D12))
+        {
+            PlayerSettings.SetGraphicsAPIs(BuildTarget.StandaloneWindows64, new[] { GraphicsDeviceType.Direct3D12 });
+        }
+    }
+
+    static void DisableStaticBatching()
+    {
+        PlayerSettings.SetStaticBatching(false);
+    }
+
+    static void DisableSRPBatcherIfNeeded()
+    {
+        var hdrpAsset = HDRenderPipeline.currentAsset;
+        if (hdrpAsset != null && hdrpAsset.renderPipelineSettings.supportSRPBatcher)
+        {
+            hdrpAsset.renderPipelineSettings.supportSRPBatcher = false;
+            EditorUtility.SetDirty(hdrpAsset);
+        }
+    }
+
+    static Volume GetOrCreateGlobalVolume()
+    {
+        var existing = Object.FindObjectsOfType<Volume>().FirstOrDefault(v => v.name == VOLUME_NAME && v.isGlobal);
+        if (existing != null) return existing;
+
+        var go = new GameObject(VOLUME_NAME) { tag = "EditorOnly" };
+        var volume = go.AddComponent<Volume>();
+        volume.isGlobal = true;
+        volume.priority = 0;
+        Undo.RegisterCreatedObjectUndo(go, "Create RTX Volume");
+        return volume;
+    }
+
+    static VolumeProfile GetOrCreateVolumeProfile(Volume volume)
+    {
+        if (volume.profile == null || volume.profile.name != PROFILE_NAME)
+        {
+            var profile = ScriptableObject.CreateInstance<VolumeProfile>();
+            profile.name = PROFILE_NAME;
+            AssetDatabase.CreateAsset(profile, "Assets/RTX Volume Profile.asset");
+            volume.profile = profile;
+            Undo.RegisterCreatedObjectUndo(profile, "Create RTX Profile");
+        }
+        return volume.profile;
+    }
+
+    static void ApplyPreset(VolumeProfile profile, RTXPreset preset)
+    {
+        profile.components.Clear();
+
+        var quality = preset switch
+        {
+            RTXPreset.Low => RayTracingQuality.Low,
+            RTXPreset.Medium => RayTracingQuality.Medium,
+            RTXPreset.High => RayTracingQuality.High,
+            RTXPreset.Ultra => RayTracingQuality.Ultra,
+            _ => RayTracingQuality.Medium
+        };
+
+        AddOverride<RayTracingReflections>(profile, o =>
+        {
+            o.active = true;
+            o.quality.value = quality;
+            o.intensityMultiplier.value = preset == RTXPreset.Ultra ? 1.3f : 1f;
+        });
+
+        AddOverride<RayTracingShadows>(profile, o =>
+        {
+            o.active = true;
+            o.quality.value = quality;
+        });
+
+        AddOverride<RayTracingAmbientOcclusion>(profile, o =>
+        {
+            o.active = true;
+            o.quality.value = quality;
+            o.intensity.value = preset == RTXPreset.Ultra ? 1.5f : 1f;
+        });
+
+        if (HDRenderPipeline.currentAsset?.renderPipelineSettings.supportRayTracingGI == true)
+        {
+            AddOverride<RayTracingGlobalIllumination>(profile, o =>
+            {
+                o.active = true;
+                o.quality.value = quality;
+            });
+        }
+
+        AddOverride<ScreenSpaceReflection>(profile, o => o.active = false);
+    }
+
+    static void AddOverride<T>(VolumeProfile profile, System.Action<T> setup) where T : VolumeComponent, new()
+    {
+        if (profile.TryGet<T>(out var comp))
+            profile.components.Remove(comp);
+
+        comp = new T();
+        setup(comp);
+        profile.components.Add(comp);
+    }
+
+    static void SetHDRPAssetRayTracing(VolumeProfile profile)
+    {
+        var hdrp = HDRenderPipeline.currentAsset;
+        if (hdrp != null)
+        {
+            hdrp.renderPipelineSettings.supportRayTracing = true;
+            hdrp.renderPipelineSettings.rayTracing = true;
+            EditorUtility.SetDirty(hdrp);
+        }
+    }
+
+    static void DisableRayTracing()
+    {
+        PlayerSettings.SetGraphicsAPIs(BuildTarget.StandaloneWindows64, new[] { GraphicsDeviceType.Direct3D11 });
+        PlayerSettings.SetStaticBatching(true);
+        var hdrp = HDRenderPipeline.currentAsset;
+        if (hdrp != null)
+        {
+            hdrp.renderPipelineSettings.supportRayTracing = false;
+            hdrp.renderPipelineSettings.rayTracing = false;
+        }
+    }
+
+    static void RemoveRTXVolume()
+    {
+        var volume = Object.FindObjectsOfType<Volume>().FirstOrDefault(v => v.name == VOLUME_NAME);
+        if (volume != null) Undo.DestroyObjectImmediate(volume.gameObject);
+
+        var profile = AssetDatabase.LoadAssetAtPath<VolumeProfile>("Assets/RTX Volume Profile.asset");
+        if (profile != null) AssetDatabase.DeleteAsset("Assets/RTX Volume Profile.asset");
+    }
+
+    enum RTXPreset { Low, Medium, High, Ultra }
+    enum RayTracingQuality { Low = 0, Medium = 1, High = 2, Ultra = 3 }
+
+    private class RTXWizardWindow : EditorWindow
+    {
+        private RTXPreset preset = RTXPreset.Medium;
+        private bool reflections = true, shadows = true, ao = true, gi = true;
+
+        [MenuItem("Tools/Ray Tracing/Open RTX Wizard...")]
+        public static void Open() => GetWindow<RTXWizardWindow>("RTX Wizard").Show();
+
+        void OnGUI()
+        {
+            GUILayout.Label("Unity RTX Enabler 2.0", EditorStyles.boldLabel);
+            GUILayout.Space(10);
+
+            preset = (RTXPreset)EditorGUILayout.EnumPopup("Пресет качества", preset);
+
+            GUILayout.Label("Отдельные эффекты:", EditorStyles.boldLabel);
+            reflections = EditorGUILayout.Toggle("Ray Traced Reflections", reflections);
+            shadows = EditorGUILayout.Toggle("Ray Traced Shadows", shadows);
+            ao = EditorGUILayout.Toggle("Ray Traced AO", ao);
+            gi = EditorGUILayout.Toggle("Ray Traced GI (Unity 6+)", gi);
+
+            GUILayout.Space(20);
+
+            if (GUILayout.Button("ВКЛЮЧИТЬ RAY TRACING!", GUILayout.Height(40)))
+            {
+                EnableRayTracing(preset);
+                Close();
+            }
+
+            if (GUILayout.Button("Удалить всё", GUILayout.Height(30)))
+            {
+                RemoveAll();
+            }
+        }
     }
 }
-#endregion
